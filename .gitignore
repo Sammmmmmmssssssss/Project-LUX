@@ -31,3 +31,4 @@ Icon
 # Temporary Files
 tmp/
 temp/
+go_kernel/kernel
