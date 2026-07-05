@@ -1,0 +1,33 @@
+# OS-specific
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+# Go
+/go_kernel/lux_daemon
+/go_kernel/bin/
+/go_kernel/obj/
+*.test
+*.out
+
+# C / CMake / RP2040 Firmware
+/firmware/build/
+/firmware/cmake-build-*/
+/firmware/.cache/
+*.uf2
+*.elf
+*.hex
+*.bin
+*.map
+*.dis
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary Files
+tmp/
+temp/

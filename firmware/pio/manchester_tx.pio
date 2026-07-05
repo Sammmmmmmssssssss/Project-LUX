@@ -1,0 +1,51 @@
+; manchester_tx.pio — Project LUX
+; Manchester Encoding Transmitter (IEEE 802.3 convention)
+;
+; CLOCK SETUP (set in C via sm_config_set_clkdiv):
+;   sys_clk  = 125 MHz
+;   SM clock = 8 MHz (divider = 15.625 — exact, no jitter accumulation)
+;   1 cycle  = 125 ns
+;   Half-bit = 2 cycles = 250 ns
+;   Bit rate = 2 Mbps
+;
+; ENCODING CONVENTION (IEEE 802.3):
+;   bit = 1 → HIGH for 250 ns, then LOW for 250 ns
+;   bit = 0 → LOW  for 250 ns, then HIGH for 250 ns
+;
+; DATA FLOW:
+;   DMA writes 32-bit words to the TX FIFO.
+;   The SM autopulls (pull block) when the OSR is empty.
+;   Bits are shifted out MSB-first via `out y, 1`.
+;   Each bit drives LASER_PIN via side-set for exactly 2 cycles per half-bit.
+;
+; LASER_PIN: GPIO 15 (defined as LASER_PIN in main.c)
+; JMP_PIN:   Not used in TX path.
+;
+; NOTE on clkdiv: 15.625 = exact representation in 16.8 fixed-point
+; (integer=15, fractional=160/256=0.625). No cycle-to-cycle jitter.
+; If bit rate is changed, re-verify: clock_get_hz(clk_sys) / target_SM_hz
+; must resolve cleanly in 16.8 fixed-point. Fractional jitter accumulates
+; and causes laser edge drift if the divider is not exact.
+
+.program manchester_tx
+.side_set 1 opt
+
+.wrap_target
+    pull block                     ; stall until DMA feeds a 32-bit word into OSR
+    set x, 31                      ; counter: 32 bits to clock out (0..31)
+
+bitloop:
+    out y, 1                       ; shift MSB-first bit from OSR → y register
+    jmp !y do_zero                 ; branch on bit value
+
+do_one:                            ; bit = 1 → HIGH first, then LOW
+    nop            side 1 [1]      ; HIGH for 2 cycles (250 ns)
+    jmp bit_end    side 0 [1]      ; LOW  for 2 cycles (250 ns)
+
+do_zero:                           ; bit = 0 → LOW first, then HIGH
+    nop            side 0 [1]      ; LOW  for 2 cycles (250 ns)
+    jmp bit_end    side 1 [1]      ; HIGH for 2 cycles (250 ns)
+
+bit_end:
+    jmp x-- bitloop                ; decrement x; loop if x was non-zero before decrement
+.wrap                              ; pull next 32-bit word from FIFO

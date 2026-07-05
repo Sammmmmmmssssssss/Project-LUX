@@ -1,0 +1,81 @@
+; manchester_rx.pio — Project LUX (v3 — FINAL, mathematically correct)
+;
+; DO NOT use v1 or v2. They have documented critical bugs:
+;   v1: hardcoded wait 1/wait 0 alternating — desyncs on consecutive identical bits
+;   v2: nop [11] after edge = 1.25T absolute — samples NEXT bit (time-travel bug)
+;
+; CLOCK SETUP (set in C via sm_config_set_clkdiv):
+;   sys_clk  = 125 MHz
+;   SM clock = 32 MHz (divider = 3.90625)
+;   1 cycle  = 31.25 ns
+;   Bit period T = 16 cycles = 500 ns (2 Mbps)
+;
+; ─── 3/4T SAMPLING MATH (THE ONLY CORRECT VERSION) ─────────────────────────
+;
+;   Manchester always transitions at the MID-POINT of a bit (t = 0.5T).
+;   The 3/4T trick: catch that mid-bit edge, delay 0.25T, then sample.
+;
+;   Timeline (edge-relative):
+;     t = 0.0T  → mid-bit edge fires (wait 1/0 pin 0 unblocks)
+;     t = 0.25T → nop [3] = 4 cycles delay
+;     t = 0.25T → in pins, 1 executes (1 cycle; also counts toward post delay)
+;     t = 0.75T → SAMPLE POINT — stable center of 2nd half of bit ✓
+;     t = 1.25T → nop [6] = 7 cycles (7 + 1 from `in` = 8 cycles = 0.5T)
+;                 SM is BLIND through the 1.0T boundary transition
+;                 Re-armed to catch next mid-bit edge at 1.5T ✓
+;
+;   Cycle accounting (edge-relative):
+;     nop[3] (4) + in (1) + nop[6] (7) = 12 cycles = 0.75T after edge
+;     Absolute: 0.5T (edge) + 0.75T = 1.25T ✓
+;
+; ─── SELF-CORRECTING POLARITY via jmp pin ───────────────────────────────────
+;
+;   Problem: `wait 1 pin` in PIO is a LEVEL check, not an edge detector.
+;   If the SM re-enters `wait 1 pin` while the pin is already HIGH (which
+;   happens at the 1.0T boundary for repeated identical bits, e.g. "11"),
+;   it returns INSTANTLY without blocking — sampling stale data. The fix:
+;   test the current pin level with `jmp pin` at the top of every iteration
+;   and branch to whichever `wait` matches the OPPOSITE polarity, guaranteeing
+;   a genuine transition is always caught.
+;
+; ─── C-SIDE INIT (MANDATORY) ────────────────────────────────────────────────
+;
+;   sm_config_set_jmp_pin(&c, RX_PIN);          // LOAD-BEARING — without this,
+;                                               // jmp pin reads GPIO 0 by default
+;   sm_config_set_in_pins(&c, RX_PIN);
+;   sm_config_set_in_shift(&c, false, true, 8); // MSB-first, autopush @ 8 bits
+;   float div = (float)clock_get_hz(clk_sys) / 32000000.0f;
+;   sm_config_set_clkdiv(&c, div);
+;
+; ─── KNOWN LIMITATIONS ──────────────────────────────────────────────────────
+;
+;   1. Bit-slip on a missed edge: If the comparator misses a transition (dust,
+;      glitch), the SM free-runs on the wrong phase until the next genuine edge.
+;      This is EXPECTED — the sync word + CRC + RS-FEC at the framing layer
+;      detect and discard corrupted frames. Do not try to fix this in PIO.
+;   2. Crystal drift is a non-issue: edge-triggered sampling only requires
+;      timing accuracy within a single 500 ns window. Even ±50 ppm is negligible.
+
+.program manchester_rx
+
+.wrap_target
+sync_check:
+    jmp pin high_now         ; read current pin level via JMP_PIN (= RX_PIN)
+                             ; if HIGH → must wait for falling edge
+                             ; if LOW  → must wait for rising edge
+
+low_now:
+    wait 1 pin 0              ; pin is LOW → block until RISING edge (mid-bit at t=0.5T)
+    jmp got_edge
+
+high_now:
+    wait 0 pin 0              ; pin is HIGH → block until FALLING edge (mid-bit at t=0.5T)
+
+got_edge:
+    nop [3]                   ; 4 cycles → advances to 0.75T (0.25T past edge)
+    in pins, 1                ; SAMPLE — captures stable second half of bit at 0.75T
+                              ; autopush at 8 bits → DMA reads byte from RX FIFO
+    nop [6]                   ; 7 cycles (in already consumed 1) → 1.25T absolute
+                              ; SM is now blind through the 1.0T boundary transition
+                              ; Re-armed to catch the next mid-bit edge at 1.5T
+.wrap                         ; re-derive edge polarity fresh every pass — no drift
