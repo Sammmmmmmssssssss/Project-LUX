@@ -1,0 +1,25 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg: #fdfdfb;
+    --ink: #1a1a1a;
+    --accent: #2e2e2e;
+    --muted: #808080;
+  }
+
+  .dark {
+    --bg: #0c0c0c;
+    --ink: #f0f0f0;
+    --accent: #2e2e2e;
+    --muted: #888888;
+  }
+
+  body {
+    @apply bg-bg text-ink antialiased selection:bg-ink selection:text-bg;
+    height: 100vh;
+    overflow-x: hidden;
+  }
+}

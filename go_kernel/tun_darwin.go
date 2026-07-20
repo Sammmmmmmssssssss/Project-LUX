@@ -21,6 +21,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"log"
 	"os"
 
@@ -73,4 +74,25 @@ func openUtun() (*os.File, string) {
 	// Step 5: Wrap the raw fd in an *os.File for Read/Write compatibility.
 	f := os.NewFile(uintptr(fd), "utun")
 	return f, name
+}
+
+
+// readTun reads a packet from the TUN interface, stripping the 4-byte macOS header.
+func readTun(tun *os.File, buf []byte) ([]byte, error) {
+	n, err := tun.Read(buf)
+	if err != nil {
+		return nil, err
+	}
+	if n < 4 {
+		return nil, nil // Ignore too short packets
+	}
+	return buf[4:n], nil
+}
+
+// writeTun writes a packet to the TUN interface, prepending the 4-byte macOS header.
+func writeTun(tun *os.File, pkt []byte, buf []byte) error {
+	binary.BigEndian.PutUint32(buf[0:4], 2) // AF_INET = 2 on macOS
+	n := copy(buf[4:], pkt)
+	_, err := tun.Write(buf[:4+n])
+	return err
 }

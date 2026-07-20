@@ -5,8 +5,9 @@
 
 #define RX_PIN 16
 #define BUF_LEN_WORDS 1024
+#define BUF_LEN_BYTES 4096
 
-extern uint32_t rx_fifo[BUF_LEN_WORDS]; // Provided by main.c or DMA handler
+extern uint8_t rx_fifo[BUF_LEN_BYTES]; // Provided by main.c or DMA handler
 
 void lux_rx_init(PIO pio, uint sm) {
     uint offset = pio_add_program(pio, &manchester_rx_program);
@@ -37,7 +38,7 @@ void lux_rx_dma_init(PIO pio, uint sm, int dma_chan, uint8_t* fifo_ptr) {
         dma_chan, &dc,
         fifo_ptr, // write: USB bulk-in buffer / application FIFO
         &pio->rxf[sm], // read: PIO RX FIFO
-        BUF_LEN_WORDS * 4,
+        BUF_LEN_BYTES,
         false
     );
 }

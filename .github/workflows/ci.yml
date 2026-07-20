@@ -1,0 +1,104 @@
+name: CI — Project LUX
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  # ── Go Kernel Tests ──────────────────────────────────────────────────────
+  go-test:
+    name: Go Kernel (test + race + bench)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Install libusb (required for gousb CGO)
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
+
+      - name: Download dependencies
+        working-directory: go_kernel
+        run: go mod download
+
+      - name: Vet
+        working-directory: go_kernel
+        run: go vet ./...
+
+      - name: Test with race detector
+        working-directory: go_kernel
+        run: go test -v -race -count=1 ./...
+
+      - name: Benchmark (zero-allocation verification)
+        working-directory: go_kernel
+        run: |
+          go test -bench=. -benchmem -benchtime=3s ./... | tee bench.txt
+          # Fail CI if any hot-path benchmark shows allocations > 0
+          if grep -E "^Benchmark(FECEncode|FECDecode|CRC16|RingPushPop)" bench.txt | grep -v "0 allocs/op"; then
+            echo "❌ Hot-path allocation detected — zero-allocation contract violated"
+            exit 1
+          fi
+          echo "✅ Zero-allocation contract verified"
+
+  # ── Firmware Build (RP2040) ───────────────────────────────────────────────
+  firmware-build:
+    name: Firmware (CMake + Pico SDK)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install ARM toolchain and CMake
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            build-essential libstdc++-arm-none-eabi-newlib
+
+      - name: Clone Pico SDK
+        run: |
+          git clone --depth=1 https://github.com/raspberrypi/pico-sdk.git /opt/pico-sdk
+          cd /opt/pico-sdk && git submodule update --init --depth=1
+          echo "PICO_SDK_PATH=/opt/pico-sdk" >> $GITHUB_ENV
+
+      - name: Copy pico_sdk_import.cmake
+        working-directory: firmware
+        run: cp $PICO_SDK_PATH/external/pico_sdk_import.cmake .
+
+      - name: CMake Configure
+        working-directory: firmware
+        run: cmake -B build -DPICO_BOARD=pico .
+
+      - name: Build .uf2
+        working-directory: firmware
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Upload .uf2 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lux_firmware.uf2
+          path: firmware/build/*.uf2
+
+  # ── Static Analysis ───────────────────────────────────────────────────────
+  staticcheck:
+    name: Static Analysis (staticcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+      - name: Install libusb
+        run: sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      - name: Run staticcheck
+        working-directory: go_kernel
+        run: staticcheck ./...

@@ -20,10 +20,8 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"log"
-	"net"
 	"sync/atomic"
 
 	"github.com/google/gousb"
@@ -90,19 +88,6 @@ func main() {
 	uplinkRing := newSPSCRing()   // TUN → USB
 	downlinkRing := newSPSCRing() // USB → TUN
 
-	// ── FEC Codecs ────────────────────────────────────────────────────────
-	// One codec per goroutine direction — fecCodec is NOT goroutine-safe.
-	// Constructed once here; all internal buffers are pre-allocated.
-	// Neither Encode nor Decode will call make() after this point.
-	uplinkCodec, err := newFECCodec()
-	if err != nil {
-		log.Fatalf("[LUX] uplink FEC init: %v", err)
-	}
-	downlinkCodec, err := newFECCodec()
-	if err != nil {
-		log.Fatalf("[LUX] downlink FEC init: %v", err)
-	}
-
 	// ── Goroutine 1: TUN Reader (producer for uplink ring) ─────────────────
 	// Drains the kernel buffer as fast as the OS delivers packets.
 	// MUST NOT be blocked by USB latency — that's what the ring is for.
@@ -110,12 +95,14 @@ func main() {
 		// utun prepends a 4-byte AF header to every packet on macOS.
 		raw := make([]byte, mtu+4)
 		for {
-			n, err := tun.Read(raw)
+			pkt, err := readTun(tun, raw)
 			if err != nil {
 				log.Printf("[LUX] tun read: %v", err)
 				continue
 			}
-			pkt := raw[4:n] // strip the 4-byte protocol-family header
+			if pkt == nil {
+				continue
+			}
 			if !uplinkRing.push(pkt) {
 				dropCount.Add(1) // ring full — drop newest, TCP will retransmit
 			}
@@ -123,14 +110,14 @@ func main() {
 	}()
 
 	// ── Goroutine 2: USB Writer (consumer of uplink ring) ──────────────────
-	// Reads from the uplink ring, FEC-encodes, frames, and writes to RP2040.
+	// Reads from the uplink ring, frames the packet, and writes to RP2040.
 	// Decoupled from TUN reader — USB stalls do not backpressure the kernel.
-	// uplinkCodec is accessed ONLY by this goroutine — no lock needed.
 	go func() {
+		var frameBuf [maxFrameSize]byte
 		consumeLoop(uplinkRing, func(pkt []byte) {
-			// Encode returns a slice into uplinkCodec.frameBuf.
-			// Zero heap allocations. Valid until next Encode call.
-			framed := uplinkCodec.Encode(pkt)
+			// frameInto writes directly into the pre-allocated frameBuf.
+			// Zero heap allocations.
+			framed := frameInto(frameBuf[:], pkt)
 			if _, err := outEP.Write(framed); err != nil {
 				log.Printf("[LUX] usb write: %v", err)
 			}
@@ -138,9 +125,8 @@ func main() {
 	}()
 
 	// ── Goroutine 3: USB Reader (producer for downlink ring) ───────────────
-	// Reads incoming frames from the RP2040 RX PIO path, FEC-decodes, and
+	// Reads incoming frames from the RP2040 RX PIO path, deframes, and
 	// pushes recovered IPv4 payload into the downlink ring.
-	// downlinkCodec is accessed ONLY by this goroutine — no lock needed.
 	go func() {
 		// maxFrameSize covers the worst-case encoded frame with all headers.
 		buf := make([]byte, maxFrameSize)
@@ -150,11 +136,11 @@ func main() {
 				log.Printf("[LUX] usb read: %v", err)
 				continue
 			}
-			// Decode: deframes, error-corrects, and returns the raw IPv4
-			// payload from downlinkCodec.dataBacking. Zero allocations.
-			pkt := downlinkCodec.Decode(buf[:n])
+			// deframeRaw validates CRC32 and returns the raw IPv4
+			// payload pointing into buf. Zero allocations.
+			pkt := deframeRaw(buf[:n])
 			if pkt == nil {
-				continue // uncorrectable or framing failure — drop
+				continue // CRC or framing failure — drop
 			}
 			// push copies pkt into the ring slot before returning.
 			if !downlinkRing.push(pkt) {
@@ -167,17 +153,10 @@ func main() {
 	// Injects received packets back into the macOS IP stack via the TUN fd.
 	// Runs on the main goroutine — no 5th goroutine needed.
 	//
-	// macOS utun requires a 4-byte AF_INET header before each IPv4 packet.
-	// We pre-allocate a single bounce buffer (mtu+4) and reuse it every
-	// iteration — zero allocations on this path.
+	// tunWriteBuf is pre-allocated. OS-specific logic handles headers.
 	tunWriteBuf := make([]byte, mtu+4)
-	binary.BigEndian.PutUint32(tunWriteBuf[0:4], uint32(net.IPv4len))
 	consumeLoop(downlinkRing, func(pkt []byte) {
-		// pkt points into downlinkCodec.dataBacking — copy into bounce buf
-		// before calling tun.Write, which may hold the reference across a
-		// syscall boundary.
-		n := copy(tunWriteBuf[4:], pkt)
-		if _, err := tun.Write(tunWriteBuf[:4+n]); err != nil {
+		if err := writeTun(tun, pkt, tunWriteBuf); err != nil {
 			log.Printf("[LUX] tun write: %v", err)
 		}
 	})
